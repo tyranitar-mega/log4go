@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: License check
+        run: |
+          set -e
+          files=$(find . -name '*.go' -not -path './vendor/*')
+          missing=""
+          for f in $files; do
+            if ! head -1 "$f" | grep -q 'Licensed under the Apache License'; then
+              missing="$missing $f"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing license header in:$missing"
+            exit 1
+          fi
+          echo "All files have license headers."
+
+      - name: gofmt check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "All files are formatted."
+
+      - name: go build
+        run: go build ./...
