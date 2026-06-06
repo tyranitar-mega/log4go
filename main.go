@@ -2,18 +2,62 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
+
+type Config struct {
+	Logger LoggerConfig `toml:"logger"`
+}
+
+type LoggerConfig struct {
+	Stdout        StdoutConfig `toml:"stdout"`
+	OpenTelemetry OtelConfig   `toml:"opentelemetry"`
+}
+
+type StdoutConfig struct {
+	Filter string `toml:"filter"`
+}
+
+type OtelConfig struct {
+	Filter           string `toml:"filter"`
+	OtlpGrpcEndpoint string `toml:"otlp_grpc_endpoint"`
+}
+
+func loadConfig(path string) (*Config, error) {
+	var config Config
+	if _, err := toml.DecodeFile(path, &config); err != nil {
+		return nil, fmt.Errorf("decoding config file: %w", err)
+	}
+	return &config, nil
+}
+
+func parseLevel(s string) slog.Level {
+	switch strings.ToUpper(s) {
+	case "DEBUG":
+		return slog.LevelDebug
+	case "INFO":
+		return slog.LevelInfo
+	case "WARN":
+		return slog.LevelWarn
+	case "ERROR":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
 
 type multiHandler struct {
 	handlers []slog.Handler
@@ -58,13 +102,14 @@ func (h *multiHandler) WithGroup(name string) slog.Handler {
 }
 
 type otelHandler struct {
-	logger log.Logger
-	attrs  []log.KeyValue
-	group  string
+	logger   log.Logger
+	attrs    []log.KeyValue
+	group    string
+	minLevel slog.Level
 }
 
-func newOtelHandler(logger log.Logger) *otelHandler {
-	return &otelHandler{logger: logger}
+func newOtelHandler(logger log.Logger, minLevel slog.Level) *otelHandler {
+	return &otelHandler{logger: logger, minLevel: minLevel}
 }
 
 func slogLevelToOTelSeverity(level slog.Level) log.Severity {
@@ -138,6 +183,9 @@ func slogAttrToOTelKeyValue(attr slog.Attr) log.KeyValue {
 }
 
 func (h *otelHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	if level < h.minLevel {
+		return false
+	}
 	return h.logger.Enabled(ctx, log.EnabledParameters{
 		Severity: slogLevelToOTelSeverity(level),
 	})
@@ -188,9 +236,10 @@ func (h *otelHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		newAttrs[len(h.attrs)+i] = log.KeyValue{Key: key, Value: slogValueToOTelValue(attr.Value)}
 	}
 	return &otelHandler{
-		logger: h.logger,
-		attrs:  newAttrs,
-		group:  h.group,
+		logger:   h.logger,
+		attrs:    newAttrs,
+		group:    h.group,
+		minLevel: h.minLevel,
 	}
 }
 
@@ -200,9 +249,10 @@ func (h *otelHandler) WithGroup(name string) slog.Handler {
 		newGroup = h.group + "." + name
 	}
 	return &otelHandler{
-		logger: h.logger,
-		attrs:  h.attrs,
-		group:  newGroup,
+		logger:   h.logger,
+		attrs:    h.attrs,
+		group:    newGroup,
+		minLevel: h.minLevel,
 	}
 }
 
@@ -224,7 +274,7 @@ func (i *OtelInstance) Run(ctx context.Context) {
 
 	i.logger.LogAttrs(ctx, slog.LevelDebug, "configuration loaded",
 		slog.String("event", "config.load"),
-		slog.String("otel_endpoint", "localhost:4318"),
+		slog.String("otel_endpoint", "localhost:4317"),
 		slog.Int("batch_size", 10),
 	)
 
@@ -268,47 +318,99 @@ func (i *StdoutInstance) Run(ctx context.Context) {
 	i.logger.InfoContext(ctx, "stdout only: stopping")
 }
 
-func main() {
+func Run(configPath string) error {
+	config, err := loadConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceName("otel-go-example"),
-			semconv.ServiceVersion("0.1.0"),
-			semconv.DeploymentEnvironment("development"),
-		),
-	)
-	if err != nil {
-		slog.Error("failed to create resource", "error", err)
-		os.Exit(1)
+	var handlers []slog.Handler
+	var otelProvider *sdklog.LoggerProvider
+
+	if config.Logger.Stdout.Filter != "" {
+		level := parseLevel(config.Logger.Stdout.Filter)
+		handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})
+		handlers = append(handlers, handler)
 	}
 
-	exporter, err := otlploggrpc.New(ctx,
-		otlploggrpc.WithEndpoint("localhost:4317"),
-		otlploggrpc.WithInsecure(),
-	)
-	if err != nil {
-		slog.Error("failed to create OTLP log exporter", "error", err)
-		os.Exit(1)
+	if config.Logger.OpenTelemetry.Filter != "" {
+		endpoint := config.Logger.OpenTelemetry.OtlpGrpcEndpoint
+		endpoint = strings.TrimPrefix(endpoint, "http://")
+		endpoint = strings.TrimPrefix(endpoint, "https://")
+		if endpoint == "" {
+			endpoint = "localhost:4317"
+		}
+
+		res, err := resource.New(ctx,
+			resource.WithAttributes(
+				semconv.ServiceName("otel-go-example"),
+				semconv.ServiceVersion("0.1.0"),
+				semconv.DeploymentEnvironment("development"),
+			),
+		)
+		if err != nil {
+			return fmt.Errorf("creating resource: %w", err)
+		}
+
+		exporter, err := otlploggrpc.New(ctx,
+			otlploggrpc.WithEndpoint(endpoint),
+			otlploggrpc.WithInsecure(),
+		)
+		if err != nil {
+			return fmt.Errorf("creating OTLP log exporter: %w", err)
+		}
+
+		processor := sdklog.NewBatchProcessor(exporter, sdklog.WithExportMaxBatchSize(10))
+
+		otelProvider = sdklog.NewLoggerProvider(
+			sdklog.WithResource(res),
+			sdklog.WithProcessor(processor),
+		)
+
+		otelLogger := otelProvider.Logger("otel-go-example")
+		minLevel := parseLevel(config.Logger.OpenTelemetry.Filter)
+		otelHandler := newOtelHandler(otelLogger, minLevel)
+		handlers = append(handlers, otelHandler)
 	}
 
-	processor := sdklog.NewBatchProcessor(exporter, sdklog.WithExportMaxBatchSize(10))
+	if otelProvider != nil {
+		defer func() {
+			otelProvider.Shutdown(context.Background())
+		}()
+	}
 
-	loggerProvider := sdklog.NewLoggerProvider(
-		sdklog.WithResource(res),
-		sdklog.WithProcessor(processor),
-	)
-	defer loggerProvider.Shutdown(ctx)
+	if len(handlers) == 0 {
+		handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+		handlers = append(handlers, handler)
+	}
 
-	otelLogger := loggerProvider.Logger("otel-go-example")
-	stdoutHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	})
+	var logger *slog.Logger
+	if len(handlers) == 1 {
+		logger = slog.New(handlers[0])
+	} else {
+		logger = slog.New(newMultiHandler(handlers...))
+	}
 
-	otelInst := NewOtelInstance(slog.New(newMultiHandler(stdoutHandler, newOtelHandler(otelLogger))))
-	stdoutInst := NewStdoutInstance(slog.New(stdoutHandler))
+	slog.SetDefault(logger)
 
+	otelInst := NewOtelInstance(logger)
 	otelInst.Run(ctx)
+	stdoutInst := NewStdoutInstance(logger)
 	stdoutInst.Run(ctx)
+
+	return nil
+}
+
+func main() {
+	configPath := "config.toml"
+	if len(os.Args) > 1 {
+		configPath = os.Args[1]
+	}
+	if err := Run(configPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 }

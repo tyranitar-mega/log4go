@@ -1,0 +1,6 @@
+[logger.stdout]
+filter = "INFO"
+
+[logger.opentelemetry]
+filter = "WARN"
+otlp_grpc_endpoint = "http://localhost:4317"
