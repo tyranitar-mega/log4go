@@ -4,3 +4,4 @@ filter = "INFO"
 [logger.opentelemetry]
 filter = "WARN"
 otlp_grpc_endpoint = "http://localhost:4317"
+export_timeout = "3s"

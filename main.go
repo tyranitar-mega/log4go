@@ -34,6 +34,7 @@ type StdoutConfig struct {
 type OtelConfig struct {
 	Filter           string `toml:"filter"`
 	OtlpGrpcEndpoint string `toml:"otlp_grpc_endpoint"`
+	ExportTimeout    string `toml:"export_timeout"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -344,6 +345,14 @@ func Run(configPath string) error {
 			endpoint = "localhost:4317"
 		}
 
+		var exportTimeout time.Duration
+		if config.Logger.OpenTelemetry.ExportTimeout != "" {
+			exportTimeout, err = time.ParseDuration(config.Logger.OpenTelemetry.ExportTimeout)
+			if err != nil {
+				return fmt.Errorf("parsing export_timeout: %w", err)
+			}
+		}
+
 		res, err := resource.New(ctx,
 			resource.WithAttributes(
 				semconv.ServiceName("otel-go-example"),
@@ -355,15 +364,23 @@ func Run(configPath string) error {
 			return fmt.Errorf("creating resource: %w", err)
 		}
 
-		exporter, err := otlploggrpc.New(ctx,
-			otlploggrpc.WithEndpoint(endpoint),
-			otlploggrpc.WithInsecure(),
-		)
+		var expOpts []otlploggrpc.Option
+		expOpts = append(expOpts, otlploggrpc.WithEndpoint(endpoint), otlploggrpc.WithInsecure())
+		if exportTimeout > 0 {
+			expOpts = append(expOpts, otlploggrpc.WithTimeout(exportTimeout))
+		}
+
+		exporter, err := otlploggrpc.New(ctx, expOpts...)
 		if err != nil {
 			return fmt.Errorf("creating OTLP log exporter: %w", err)
 		}
 
-		processor := sdklog.NewBatchProcessor(exporter, sdklog.WithExportMaxBatchSize(10))
+		var procOpts []sdklog.BatchProcessorOption
+		procOpts = append(procOpts, sdklog.WithExportMaxBatchSize(10))
+		if exportTimeout > 0 {
+			procOpts = append(procOpts, sdklog.WithExportTimeout(exportTimeout))
+		}
+		processor := sdklog.NewBatchProcessor(exporter, procOpts...)
 
 		otelProvider = sdklog.NewLoggerProvider(
 			sdklog.WithResource(res),
