@@ -1,4 +1,4 @@
-module github.com/tyranitar-mega/otel-go-example
+module github.com/tyranitar-mega/log4go
 
 go 1.26.3
 
