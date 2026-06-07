@@ -22,7 +22,7 @@ jobs:
           files=$(find . -name '*.go' -not -path './vendor/*')
           missing=""
           for f in $files; do
-            if ! head -1 "$f" | grep -q 'Licensed under the Apache License'; then
+            if ! head -5 "$f" | grep -q 'Licensed under the Apache License'; then
               missing="$missing $f"
             fi
           done
