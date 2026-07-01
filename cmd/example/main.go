@@ -76,7 +76,7 @@ func main() {
 	logger.LogAttrs(ctx, slog.LevelInfo, "user created",
 		slog.String("event", "user.created"),
 		slog.String("user_id", "usr_abc123"),
-		slog.String("email", "user@example.com"),
+		slog.Any("email", []string{"user@example.com", "admin@example.com"}),
 		slog.Int("permissions", 0o755),
 		slog.Duration("processing_time", 250*time.Millisecond),
 	)
